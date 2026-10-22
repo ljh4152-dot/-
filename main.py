@@ -8,14 +8,21 @@ import pytz
 st.title("🍿 일일 박스오피스 순위")
 
 # 1. 한국 시간 기준으로 '어제' 날짜 계산하기
-# 배포 서버의 시간이 한국과 다를 수 있으므로 명시적으로 한국 시간대(KST)를 사용합니다.
 kst_timezone = pytz.timezone('Asia/Seoul')
 now_kst = datetime.datetime.now(kst_timezone)
 yesterday_kst = now_kst - datetime.timedelta(days=1)
+yesterday_date = yesterday_kst.date() # 시간 빼고 날짜만 추출
+
+# 💡 [추가] 달력 위젯으로 조회 날짜 선택하기 (기본값과 최대값을 '어제'로 제한)
+selected_date = st.date_input(
+    "조회할 날짜를 선택하세요",
+    value=yesterday_date,
+    max_value=yesterday_date
+)
 
 # API 요청에 필요한 'YYYYMMDD' 형식으로 변환
-target_dt = yesterday_kst.strftime('%Y%m%d')
-display_date = yesterday_kst.strftime('%Y년 %m월 %d일')
+target_dt = selected_date.strftime('%Y%m%d')
+display_date = selected_date.strftime('%Y년 %m월 %d일')
 
 st.subheader(f"{display_date} 기준")
 
@@ -23,7 +30,6 @@ st.subheader(f"{display_date} 기준")
 try:
     api_key = st.secrets["KOBIS_KEY"]
 except KeyError:
-    # 키가 없을 경우 안내 메시지 출력 후 앱 실행 중단
     st.error("🚨 API 인증키를 찾을 수 없습니다. Streamlit Cloud의 [Settings] - [Secrets]에 `KOBIS_KEY`를 등록해 주세요.")
     st.stop()
 
@@ -36,7 +42,6 @@ params = {
 
 try:
     response = requests.get(url, params=params)
-    # HTTP 에러가 발생했는지 확인
     response.raise_for_status()
 except Exception as e:
     st.error("🚨 영화진흥위원회 서버와 통신하는 데 실패했습니다. 잠시 후 다시 시도해 주세요.")
@@ -45,64 +50,101 @@ except Exception as e:
 # 4. 응답 데이터 처리 및 에러 확인
 data = response.json()
 
-# KOBIS API는 키가 틀려도 200 상태코드와 함께 faultInfo 상자를 보냅니다.
 if "faultInfo" in data:
     error_message = data["faultInfo"].get("message", "알 수 없는 에러")
     st.error(f"🚨 API 요청이 거절되었습니다. 인증키가 유효한지 확인해 주세요.\n\n에러 내용: {error_message}")
     st.stop()
 
-# 정상적인 응답 구조인지 확인
 if "boxOfficeResult" not in data or "dailyBoxOfficeList" not in data["boxOfficeResult"]:
     st.error("🚨 알 수 없는 데이터 구조입니다. API 명세가 변경되었을 수 있습니다.")
     st.stop()
 
 movie_list = data["boxOfficeResult"]["dailyBoxOfficeList"]
 
-# 영화 목록이 비어있는 경우 (아직 집계 전이거나 데이터가 없는 날)
+# 💡 [추가] 영화 목록이 비어있는 경우 안내 (집계 전)
 if not movie_list:
-    st.warning(f"📭 {display_date}의 박스오피스 데이터가 아직 집계되지 않았거나 제공되지 않습니다.")
+    st.warning(f"📭 {display_date}은(는) 아직 집계 전입니다.")
     st.stop()
 
 # 5. 데이터프레임으로 변환 및 데이터 가공
 df = pd.DataFrame(movie_list)
 
-# API에서 숫자가 모두 문자열로 오기 때문에 정수형으로 변환해 줍니다.
+# 숫자로 쓸 데이터들을 정수로 변환
 numeric_columns = ['rank', 'rankInten', 'audiCnt', 'audiAcc', 'scrnCnt']
 for col in numeric_columns:
     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
 
+# 💡 [추가] 순위 변동 기호 만들기 (오르면 ▲, 내리면 ▼, 그대로면 -)
+def format_trend(x):
+    if x > 0:
+        return f"▲ {x}"
+    elif x < 0:
+        return f"▼ {abs(x)}"
+    else:
+        return "-"
+
+df['순위 변동'] = df['rankInten'].apply(format_trend)
+
+# 💡 [추가] 누적 관객 100만 명 이상 영화 이름 옆에 트로피 붙이기
+df['movieNm'] = df.apply(
+    lambda row: row['movieNm'] + ' 🏆' if row['audiAcc'] >= 1000000 else row['movieNm'], 
+    axis=1
+)
+
 # 6. 화면 출력: 1위 영화 지표 카드 (3장)
 st.write("---")
 st.write("### 🥇 1위 영화")
-top_movie = df.iloc[0] # 순위가 가장 높은 첫 번째 데이터
+top_movie = df.iloc[0]
 
 col1, col2, col3 = st.columns(3)
 col1.metric(label="영화명", value=top_movie['movieNm'])
-col2.metric(label="일일 관객수", value=f"{top_movie['audiCnt']:,}명", delta=f"전일대비 순위 {top_movie['rankInten']}" if top_movie['rankInten'] != 0 else None)
+
+# 지표 카드 하단에 들어갈 증감 텍스트 (순위 변동)
+delta_text = None
+if top_movie['rankInten'] > 0:
+    delta_text = f"전일대비 {top_movie['rankInten']} 계단 상승"
+elif top_movie['rankInten'] < 0:
+    delta_text = f"전일대비 {abs(top_movie['rankInten'])} 계단 하락"
+
+col2.metric(label="일일 관객수", value=f"{top_movie['audiCnt']:,}명", delta=delta_text)
 col3.metric(label="누적 관객수", value=f"{top_movie['audiAcc']:,}명")
 
 # 7. 화면 출력: 관객수 상위 5편 막대그래프
 st.write("---")
 st.write("### 📊 관객수 상위 5편")
 top5_df = df.head(5).copy()
-# 그래프의 X축에 영화명을 표시하기 위해 인덱스로 설정합니다.
 top5_df.set_index('movieNm', inplace=True)
-# 스트림릿 내장 차트로 일일 관객수를 그립니다.
 st.bar_chart(top5_df['audiCnt'])
 
 # 8. 화면 출력: 전체 영화 데이터 표
 st.write("---")
 st.write("### 📋 박스오피스 전체 순위표")
 
-# 화면에 보여줄 열만 선택하고 이름을 한글로 보기 좋게 변경합니다.
-display_df = df[['rank', 'movieNm', 'openDt', 'audiCnt', 'audiAcc', 'scrnCnt']].copy()
-display_df.columns = ['순위', '영화명', '개봉일', '관객수', '누적관객', '스크린수']
+# 화면에 보여줄 열만 고르고 순서를 정리합니다.
+display_df = df[['rank', '순위 변동', 'movieNm', 'openDt', 'audiCnt', 'audiAcc', 'scrnCnt']].copy()
+display_df.columns = ['순위', '순위 변동', '영화명', '개봉일', '관객수', '누적관객', '스크린수']
 
-# 천 단위 콤마 포맷팅을 적용하여 보기 좋게 출력합니다.
-formatted_df = display_df.style.format({
+# 💡 [추가] 표 안의 글자 색상을 바꾸는 함수 (▲는 빨간색, ▼는 파란색)
+def color_trend(val):
+    if isinstance(val, str):
+        if '▲' in val:
+            return 'color: red;'
+        elif '▼' in val:
+            return 'color: blue;'
+    return ''
+
+# 판다스 버전에 따라 호환되도록 색상 칠하기(map 또는 applymap) 적용 후, 숫자 포맷팅
+try:
+    styler = display_df.style.map(color_trend, subset=['순위 변동'])
+except AttributeError:
+    # 구버전 판다스를 위한 대비책
+    styler = display_df.style.applymap(color_trend, subset=['순위 변동'])
+
+formatted_df = styler.format({
     "관객수": "{:,}",
     "누적관객": "{:,}",
     "스크린수": "{:,}"
 })
 
+# 깔끔하게 인덱스(행 번호)를 숨기고 너비를 꽉 채워서 표를 그립니다.
 st.dataframe(formatted_df, use_container_width=True, hide_index=True)
